@@ -60,6 +60,7 @@ class DomainIPGrabber:
         self.subdomains = set()
         self.urls = set()
         self.emails = set()
+        self.running = True
         
         self.domains_lock = threading.Lock()
         self.ips_lock = threading.Lock()
