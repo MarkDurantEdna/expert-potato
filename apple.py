@@ -12,6 +12,12 @@ from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+# Nonaktifkan warning SSL
+warnings.filterwarnings('ignore', category=InsecureRequestWarning)
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
 # Inisialisasi colorama
 init(autoreset=True)
@@ -61,82 +67,79 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36"
 ]
 
-# Subdomain sources yang TERBUKTI BEKERJA
+# Subdomain sources yang sudah difilter dan stabil
 SUBDOMAIN_SOURCES = [
     {
-        'name': 'crt.sh',
-        'url': 'https://crt.sh/?q=%.{domain}&output=json',
-        'parser': 'parse_crtsh',
-        'weight': 10,
-        'timeout': 15
+        'name': 'alienvault',
+        'url': 'https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns',
+        'parser': 'parse_alienvault',
+        'weight': 8,
+        'timeout': 15,
+        'verify_ssl': True
+    },
+    {
+        'name': 'urlscan',
+        'url': 'https://urlscan.io/api/v1/search/?q=domain:{domain}',
+        'parser': 'parse_urlscan',
+        'weight': 7,
+        'timeout': 15,
+        'verify_ssl': True
+    },
+    {
+        'name': 'wayback',
+        'url': 'https://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&fl=original&collapse=urlkey',
+        'parser': 'parse_wayback',
+        'weight': 7,
+        'timeout': 20,
+        'verify_ssl': True
     },
     {
         'name': 'hackertarget',
         'url': 'https://api.hackertarget.com/hostsearch/?q={domain}',
         'parser': 'parse_hackertarget',
         'weight': 8,
-        'timeout': 10
-    },
-    {
-        'name': 'alienvault',
-        'url': 'https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns',
-        'parser': 'parse_alienvault',
-        'weight': 8,
-        'timeout': 10
+        'timeout': 15,
+        'verify_ssl': True
     },
     {
         'name': 'rapiddns',
         'url': 'https://rapiddns.io/subdomain/{domain}?full=1&output=json',
         'parser': 'parse_rapiddns',
         'weight': 7,
-        'timeout': 10
+        'timeout': 15,
+        'verify_ssl': True
     },
     {
         'name': 'bufferover',
         'url': 'https://dns.bufferover.run/dns?q=.{domain}',
         'parser': 'parse_bufferover',
         'weight': 7,
-        'timeout': 10
-    },
-    {
-        'name': 'urlscan',
-        'url': 'https://urlscan.io/api/v1/search/?q=domain:{domain}',
-        'parser': 'parse_urlscan',
-        'weight': 5,
-        'timeout': 15
-    },
-    {
-        'name': 'wayback',
-        'url': 'https://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&fl=original&collapse=urlkey',
-        'parser': 'parse_wayback',
-        'weight': 5,
-        'timeout': 20
+        'timeout': 15,
+        'verify_ssl': True
     },
     {
         'name': 'certspotter',
         'url': 'https://api.certspotter.com/v1/issuances?domain={domain}&include_subdomains=true&expand=dns_names',
         'parser': 'parse_certspotter',
-        'weight': 6,
-        'timeout': 10
-    },
+        'weight': 8,
+        'timeout': 15,
+        'verify_ssl': True
+    }
+]
+
+# Alternative sources for crt.sh (karena sering kena rate limit)
+CRTSH_ALTERNATIVES = [
     {
-        'name': 'threatcrowd',
-        'url': 'https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={domain}',
-        'parser': 'parse_threatcrowd',
-        'weight': 5,
-        'timeout': 10
-    },
-    {
-        'name': 'anubis',
-        'url': 'https://jldc.me/anubis/subdomains/{domain}',
-        'parser': 'parse_anubis',
-        'weight': 7,
-        'timeout': 10
+        'name': 'crt.sh (backup 1)',
+        'url': 'https://crt.sh/?q=%.{domain}&output=json',
+        'parser': 'parse_crtsh',
+        'timeout': 10,
+        'verify_ssl': False  # crt.sh sering bermasalah dengan SSL
     }
 ]
 
 class SubdomainScanner:
-    def __init__(self, domain, max_retries=3):
+    def __init__(self, domain, max_retries=2):
         self.domain = domain
         self.max_retries = max_retries
         self.session = self._create_session()
@@ -146,8 +149,8 @@ class SubdomainScanner:
         """Create session with retry strategy"""
         session = requests.Session()
         retry_strategy = Retry(
-            total=2,
-            backoff_factor=1,
+            total=1,
+            backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503, 504],
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -161,49 +164,54 @@ class SubdomainScanner:
             'User-Agent': random.choice(USER_AGENTS),
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
+            'Cache-Control': 'no-cache'
         }
     
-    def _make_request(self, url, timeout=10, source_name=""):
+    def _make_request(self, url, timeout=10, source_name="", verify_ssl=True):
         """Make HTTP request with rate limiting and error handling"""
         for attempt in range(self.max_retries):
             try:
-                # Rate limiting
-                time.sleep(random.uniform(1, 2))
+                # Rate limiting - random delay
+                time.sleep(random.uniform(1.5, 3))
                 
                 response = self.session.get(
                     url, 
                     headers=self._get_headers(), 
                     timeout=timeout,
-                    verify=False  # Disable SSL verification for some sources
+                    verify=verify_ssl
                 )
                 
                 if response.status_code == 200:
                     return response
                 elif response.status_code == 429:
                     # Too many requests - wait longer
-                    wait_time = (attempt + 1) * 5
+                    wait_time = (attempt + 1) * 10
                     print(Fore.YELLOW + f"[!] Rate limited by {source_name}, waiting {wait_time}s...")
                     time.sleep(wait_time)
                 else:
                     print(Fore.YELLOW + f"[!] {source_name} returned status {response.status_code}")
+                    return None  # Don't retry on other status codes
                     
             except requests.exceptions.Timeout:
                 print(Fore.YELLOW + f"[!] Timeout for {source_name} (attempt {attempt + 1})")
+                if attempt < self.max_retries - 1:
+                    time.sleep(2)
             except requests.exceptions.ConnectionError:
                 print(Fore.YELLOW + f"[!] Connection error for {source_name} (attempt {attempt + 1})")
+                if attempt < self.max_retries - 1:
+                    time.sleep(2)
             except Exception as e:
-                print(Fore.YELLOW + f"[!] Error for {source_name}: {str(e)}")
+                print(Fore.YELLOW + f"[!] Error for {source_name}: {str(e)[:50]}")
+                return None
             
             if attempt < self.max_retries - 1:
-                time.sleep(2 * (attempt + 1))
+                time.sleep(2)
         
         return None
     
-    # Parser functions for each source
+    # Parser functions
     def parse_crtsh(self, response):
         """Parse crt.sh response"""
         subdomains = set()
@@ -215,7 +223,7 @@ class SubdomainScanner:
                     for name in names:
                         if name and self.domain in name:
                             clean_name = name.strip().lower()
-                            if clean_name.endswith(self.domain):
+                            if clean_name.endswith(self.domain) and '*' not in clean_name:
                                 subdomains.add(clean_name)
         except:
             pass
@@ -226,11 +234,11 @@ class SubdomainScanner:
         subdomains = set()
         try:
             lines = response.text.strip().split('\n')
-            for line in lines:
+            for line in lines[:1000]:  # Limit to 1000 lines
                 if ',' in line:
-                    subdomain = line.split(',')[0].strip()
-                    if subdomain and self.domain in subdomain:
-                        subdomains.add(subdomain.lower())
+                    subdomain = line.split(',')[0].strip().lower()
+                    if subdomain and subdomain.endswith(self.domain) and '*' not in subdomain:
+                        subdomains.add(subdomain)
         except:
             pass
         return subdomains
@@ -241,10 +249,10 @@ class SubdomainScanner:
         try:
             data = response.json()
             if 'passive_dns' in data:
-                for entry in data['passive_dns']:
+                for entry in data['passive_dns'][:500]:  # Limit entries
                     if 'hostname' in entry:
                         hostname = entry['hostname'].lower()
-                        if hostname.endswith(self.domain):
+                        if hostname.endswith(self.domain) and '*' not in hostname:
                             subdomains.add(hostname)
         except:
             pass
@@ -256,10 +264,10 @@ class SubdomainScanner:
         try:
             data = response.json()
             if isinstance(data, list):
-                for item in data:
+                for item in data[:500]:  # Limit items
                     if isinstance(item, dict) and 'name' in item:
                         name = item['name'].lower()
-                        if name.endswith(self.domain):
+                        if name.endswith(self.domain) and '*' not in name:
                             subdomains.add(name)
         except:
             pass
@@ -271,10 +279,10 @@ class SubdomainScanner:
         try:
             data = response.json()
             if 'FDNS_A' in data:
-                for entry in data['FDNS_A']:
+                for entry in data['FDNS_A'][:500]:  # Limit entries
                     if ',' in entry:
                         subdomain = entry.split(',')[1].lower()
-                        if subdomain.endswith(self.domain):
+                        if subdomain.endswith(self.domain) and '*' not in subdomain:
                             subdomains.add(subdomain)
         except:
             pass
@@ -286,10 +294,10 @@ class SubdomainScanner:
         try:
             data = response.json()
             if 'results' in data:
-                for result in data['results']:
+                for result in data['results'][:100]:  # Limit results
                     if 'page' in result and 'domain' in result['page']:
                         domain = result['page']['domain'].lower()
-                        if domain.endswith(self.domain):
+                        if domain.endswith(self.domain) and '*' not in domain:
                             subdomains.add(domain)
         except:
             pass
@@ -301,14 +309,13 @@ class SubdomainScanner:
         try:
             data = response.json()
             if isinstance(data, list):
-                for item in data:
+                for item in data[:1000]:  # Limit items
                     if isinstance(item, list) and len(item) > 0:
                         url = item[0].lower()
-                        # Extract domain from URL
                         parsed = urlparse(url)
                         if parsed.netloc:
-                            domain = parsed.netloc
-                            if domain.endswith(self.domain):
+                            domain = parsed.netloc.split(':')[0]  # Remove port
+                            if domain.endswith(self.domain) and '*' not in domain:
                                 subdomains.add(domain)
         except:
             pass
@@ -319,38 +326,12 @@ class SubdomainScanner:
         subdomains = set()
         try:
             data = response.json()
-            for entry in data:
+            for entry in data[:50]:  # Limit entries
                 if 'dns_names' in entry:
                     for name in entry['dns_names']:
-                        name = name.lower()
-                        if name.endswith(self.domain):
+                        name = name.lower().strip()
+                        if name.endswith(self.domain) and '*' not in name:
                             subdomains.add(name)
-        except:
-            pass
-        return subdomains
-    
-    def parse_threatcrowd(self, response):
-        """Parse threatcrowd response"""
-        subdomains = set()
-        try:
-            data = response.json()
-            if 'subdomains' in data:
-                for sub in data['subdomains']:
-                    if sub.endswith(self.domain):
-                        subdomains.add(sub.lower())
-        except:
-            pass
-        return subdomains
-    
-    def parse_anubis(self, response):
-        """Parse anubis response"""
-        subdomains = set()
-        try:
-            data = response.json()
-            if isinstance(data, list):
-                for sub in data:
-                    if sub.endswith(self.domain):
-                        subdomains.add(sub.lower())
         except:
             pass
         return subdomains
@@ -359,7 +340,8 @@ class SubdomainScanner:
         """Scan all sources for subdomains"""
         print(Fore.CYAN + f"\n[+] Scanning subdomains for {self.domain} from multiple sources...")
         
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # Scan main sources
+        with ThreadPoolExecutor(max_workers=3) as executor:  # Kurangi concurrent workers
             futures = []
             for source in SUBDOMAIN_SOURCES:
                 url = source['url'].format(domain=self.domain)
@@ -369,28 +351,63 @@ class SubdomainScanner:
                         source['name'], 
                         url, 
                         source['parser'], 
-                        source['timeout']
+                        source['timeout'],
+                        source['verify_ssl']
                     )
                 )
             
             for future in as_completed(futures):
                 try:
-                    subdomains = future.result()
+                    subdomains = future.result(timeout=10)
                     self.found_subdomains.update(subdomains)
                 except Exception as e:
-                    print(Fore.RED + f"[!] Error in source scan: {str(e)}")
+                    print(Fore.RED + f"[!] Error in source scan: {str(e)[:50]}")
         
-        # Also try the original ip.thc.org source with larger limit
+        # Try crt.sh separately with different approach
+        self._scan_crtsh()
+        
+        # Try original thc source
         self._scan_thc_source()
         
         return self.found_subdomains
     
-    def _scan_source(self, source_name, url, parser_name, timeout):
+    def _scan_crtsh(self):
+        """Scan crt.sh with special handling"""
+        for source in CRTSH_ALTERNATIVES:
+            try:
+                url = source['url'].format(domain=self.domain)
+                print(Fore.BLUE + f"[~] Querying {source['name']}...")
+                
+                # Special handling for crt.sh
+                time.sleep(random.uniform(3, 5))  # Longer delay for crt.sh
+                response = self.session.get(
+                    url,
+                    headers=self._get_headers(),
+                    timeout=source['timeout'],
+                    verify=source['verify_ssl']
+                )
+                
+                if response.status_code == 200:
+                    subdomains = self.parse_crtsh(response)
+                    if subdomains:
+                        print(Fore.GREEN + f"[✓] {source['name']}: {len(subdomains)} subdomains found")
+                        self.found_subdomains.update(subdomains)
+                    else:
+                        print(Fore.YELLOW + f"[-] {source['name']}: No subdomains found")
+                elif response.status_code == 429:
+                    print(Fore.YELLOW + f"[!] {source['name']} rate limited, skipping...")
+                else:
+                    print(Fore.YELLOW + f"[-] {source['name']}: Returned {response.status_code}")
+                    
+            except Exception as e:
+                print(Fore.YELLOW + f"[!] {source['name']} error: {str(e)[:50]}")
+    
+    def _scan_source(self, source_name, url, parser_name, timeout, verify_ssl):
         """Scan individual source"""
         subdomains = set()
         try:
             print(Fore.BLUE + f"[~] Querying {source_name}...")
-            response = self._make_request(url, timeout, source_name)
+            response = self._make_request(url, timeout, source_name, verify_ssl)
             
             if response:
                 parser = getattr(self, parser_name)
@@ -400,28 +417,29 @@ class SubdomainScanner:
                 else:
                     print(Fore.YELLOW + f"[-] {source_name}: No subdomains found")
             else:
-                print(Fore.RED + f"[✗] {source_name}: Failed to fetch data")
+                print(Fore.YELLOW + f"[-] {source_name}: Failed to fetch data")
                 
         except Exception as e:
-            print(Fore.RED + f"[!] Error scanning {source_name}: {str(e)}")
+            print(Fore.RED + f"[!] Error scanning {source_name}: {str(e)[:50]}")
         
         return subdomains
     
     def _scan_thc_source(self):
-        """Scan original thc source with larger limit"""
+        """Scan original thc source with smaller limits"""
         try:
-            # Try with increasing limits to avoid detection
-            for limit in [10000, 25000, 50000, 100000]:
+            # Use smaller limits to avoid detection
+            for limit in [1000, 5000, 10000]:
                 url = f"https://ip.thc.org/api/v1/subdomains/download?domain={self.domain}&limit={limit}&hide_header=true"
                 print(Fore.BLUE + f"[~] Querying ip.thc.org with limit {limit}...")
                 
-                response = self._make_request(url, timeout=20, source_name="ip.thc.org")
+                response = self._make_request(url, timeout=15, source_name="ip.thc.org", verify_ssl=False)
                 
                 if response and response.status_code == 200 and response.text.strip():
                     subdomains = response.text.strip().split('\n')
                     # Filter valid subdomains
                     valid_subdomains = {sub.lower() for sub in subdomains 
-                                      if sub and self.domain in sub.lower()}
+                                      if sub and self.domain in sub.lower() 
+                                      and '*' not in sub}
                     
                     if valid_subdomains:
                         print(Fore.GREEN + f"[✓] ip.thc.org ({limit}): {len(valid_subdomains)} subdomains found")
@@ -429,7 +447,7 @@ class SubdomainScanner:
                         break  # Stop if successful
                     
         except Exception as e:
-            print(Fore.RED + f"[!] Error scanning ip.thc.org: {str(e)}")
+            print(Fore.YELLOW + f"[!] ip.thc.org scan skipped: {str(e)[:50]}")
 
 # Fungsi untuk mengubah domain menjadi IP
 def domain_to_ip(domain):
@@ -438,7 +456,7 @@ def domain_to_ip(domain):
     except socket.gaierror:
         return None
 
-# Fungsi untuk mendapatkan subdomain (updated)
+# Fungsi untuk mendapatkan subdomain (updated with better error handling)
 def get_subdomains(domain, output_file):
     if domain in scanned_subdomains:
         print(Fore.YELLOW + f"[!] Skipping Subdomain Scan for {domain}, already scanned.")
@@ -455,7 +473,7 @@ def get_subdomains(domain, output_file):
         
         if new_subdomains:
             print(Fore.BLUE + f"[+] {domain} => {len(new_subdomains)} New Subdomains Found (Total: {len(all_subdomains)})")
-            for sub in new_subdomains:
+            for sub in new_subdomains[:1000]:  # Limit saving to 1000 per domain to avoid huge files
                 buffer.write(sub + "\n")
                 scanned_subdomains.add(sub)
             
@@ -465,7 +483,7 @@ def get_subdomains(domain, output_file):
             print(Fore.YELLOW + f"[?] {domain} => No New Subdomains Found.")
             
     except Exception as e:
-        print(Fore.RED + f"[!] Error fetching subdomains for {domain}: {str(e)}")
+        print(Fore.RED + f"[!] Error in subdomain scan for {domain}: {str(e)[:50]}")
     finally:
         buffer.close()
 
@@ -483,15 +501,16 @@ def revip(target, scan_subdomains=False, filter_extensions=False, output_file=DE
             if target is None:
                 return
 
-        url = f"https://ip.thc.org/api/v1/download?ip_address={target}&limit=50000&hide_header=true"
+        # Use smaller limit for stability
+        url = f"https://ip.thc.org/api/v1/download?ip_address={target}&limit=10000&hide_header=true"
         headers = {"User-Agent": random.choice(USER_AGENTS)}
-        response = requests.get(url, headers=headers, timeout=15)
-        time.sleep(1)  # Jeda untuk stabilitas
+        response = requests.get(url, headers=headers, timeout=15, verify=False)
+        time.sleep(random.uniform(1, 2))
 
         if response.status_code == 200 and response.text.strip():
             lines = response.text.strip().split("\n")
             extracted_domains = []
-            for line in lines:
+            for line in lines[:2000]:  # Limit to 2000 domains per IP
                 parts = line.split(",")
                 if len(parts) > 1:
                     extracted_domains.append(parts[1])
@@ -522,22 +541,23 @@ def revip(target, scan_subdomains=False, filter_extensions=False, output_file=DE
             with open(output_file, "a") as file:
                 file.write(buffer.getvalue())
 
-            if scan_subdomains:
-                print(Fore.CYAN + f"\n[+] Starting subdomain scan for {len(unique_domains if not filter_extensions else filtered_domains)} domains...")
+            if scan_subdomains and (unique_domains or filtered_domains):
+                print(Fore.CYAN + f"\n[+] Starting subdomain scan for selected domains...")
                 
-                # Use smaller thread pool for subdomain scans due to multiple sources
-                pool = ThreadPool(2)  # Reduced thread count to avoid rate limiting
-                domains_to_scan = unique_domains if not filter_extensions else filtered_domains
-                pool.map(lambda domain: get_subdomains(domain, SUBDOMAIN_FILE), domains_to_scan)
-                pool.close()
-                pool.join()
+                # Use single thread for subdomain scans to avoid rate limiting
+                domains_to_scan = list(unique_domains if not filter_extensions else filtered_domains)
+                domains_to_scan = domains_to_scan[:5]  # Limit to 5 domains per IP for subdomain scan
+                
+                for domain in domains_to_scan:
+                    get_subdomains(domain, SUBDOMAIN_FILE)
+                    time.sleep(random.uniform(2, 3))  # Delay between subdomain scans
 
     except Exception as e:
-        print(Fore.RED + f"[!] Error fetching data for {target}: {str(e)}")
+        print(Fore.RED + f"[!] Error fetching data for {target}: {str(e)[:50]}")
     finally:
         buffer.close()
 
-# Menu utama (sama seperti sebelumnya)
+# Menu utama
 print(Fore.GREEN + "[1] Reverse IP Only")
 print(Fore.GREEN + "[2] Reverse IP + Subdomain Scan (Multi-Source)")
 print(Fore.GREEN + "[3] Remove Duplicate Domains")
@@ -587,17 +607,19 @@ if select in ["1", "2", "4"]:
     Thread = input(Fore.WHITE + 'Thread:~# ')
     try:
         thread_count = int(Thread)
-        if thread_count > 8:  # Reduced max threads for stability
-            print(Fore.YELLOW + "[!] Thread capped at 8 for stability.")
-            thread_count = 8
+        if thread_count > 5:  # Reduced max threads for stability
+            print(Fore.YELLOW + "[!] Thread capped at 5 for stability.")
+            thread_count = 5
     except ValueError:
         print(Fore.RED + "[!] Masukkan angka yang valid untuk jumlah thread.")
         exit()
 
-    pool = ThreadPool(thread_count)
-    pool.map(lambda target: revip(target, scan_subdomains, filter_extensions, output_file, custom_extensions), targets)
-    pool.close()
-    pool.join()
+    # Process targets sequentially with delay
+    for i, target in enumerate(targets):
+        print(Fore.CYAN + f"\n[+] Processing target {i+1}/{len(targets)}: {target}")
+        revip(target, scan_subdomains, filter_extensions, output_file, custom_extensions)
+        if i < len(targets) - 1:
+            time.sleep(random.uniform(2, 4))  # Delay between targets
 
     print("===============================")
     if os.path.exists(output_file):
