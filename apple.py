@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Deep Subdomain Crawler - HYPERSPEED EDITION
-Target: 500+ URL/detik menggunakan parallel processing maksimal + jq integration
+Deep Subdomain Crawler - SPEED + ACCURACY EDITION
+Menggabungkan kecepatan tinggi DENGAN akurasi script sebelumnya
+Target: 100-200 URL/detik dengan hasil akurat
 """
 
-import subprocess
+import requests
 import json
 import time
 import argparse
 from typing import Set, List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 import urllib3
 import sys
 import os
 import re
 from datetime import datetime
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-import queue
 import threading
-import signal
-import tempfile
-import gzip
-import io
+import queue
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -38,15 +35,81 @@ class Colors:
     DIM = '\033[2m'
     RESET = '\033[0m'
 
-class HyperspeedCrawler:
+class FastAccurateCrawler:
     def __init__(self, output_file: str = "all_subdomains.txt", 
-                 threads: int = 100,  # Increased dramatically
-                 batch_size: int = 1000,
-                 delay: float = 0.001):  # Minimal delay
+                 threads: int = 50, 
+                 delay: float = 0.01):
         self.output_file = output_file
         self.threads = threads
-        self.batch_size = batch_size
         self.delay = delay
+        self.session = requests.Session()
+        
+        # Penting: Gunakan connection pooling untuk kecepatan
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=100,
+            pool_maxsize=1000,
+            max_retries=2,
+            pool_block=False
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json',
+            'Connection': 'keep-alive'
+        })
+        self.session.timeout = 10
+        
+        # Semua sumber API yang TERBUKTI BEKERJA dari script sebelumnya
+        self.sources = {
+            'crt_sh': {
+                'url': 'https://crt.sh/?q=%.{domain}&output=json',
+                'parser': self.parse_crtsh,
+                'enabled': True,
+            },
+            'hackertarget': {
+                'url': 'https://api.hackertarget.com/hostsearch/?q={domain}',
+                'parser': self.parse_hackertarget,
+                'enabled': True,
+            },
+            'alienvault': {
+                'url': 'https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns',
+                'parser': self.parse_alienvault,
+                'enabled': True,
+            },
+            'urlscan': {
+                'url': 'https://urlscan.io/api/v1/search/?q=domain:{domain}',
+                'parser': self.parse_urlscan,
+                'enabled': True,
+            },
+            'wayback': {
+                'url': 'https://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&fl=original&collapse=urlkey',
+                'parser': self.parse_wayback,
+                'enabled': True,
+            },
+            'bufferover': {
+                'url': 'https://dns.bufferover.run/dns?q=.{domain}',
+                'parser': self.parse_bufferover,
+                'enabled': True,
+            },
+            'rapiddns': {
+                'url': 'https://rapiddns.io/subdomain/{domain}?full=1&output=json',
+                'parser': self.parse_rapiddns,
+                'enabled': True,
+            },
+            'anubis': {
+                'url': 'https://jldc.me/anubis/subdomains/{domain}',
+                'parser': self.parse_anubis,
+                'enabled': True,
+            },
+            'threatcrowd': {
+                'url': 'https://www.threatcrowd.org/searchApi/v2/domain/report/?domain={domain}',
+                'parser': self.parse_threatcrowd,
+                'enabled': True,
+            }
+        }
+        
         self.all_subdomains = set()
         self.stats = {
             'total_requests': 0,
@@ -54,303 +117,297 @@ class HyperspeedCrawler:
             'failed': 0,
             'by_source': {},
             'start_time': time.time(),
-            'domains_processed': 0
+            'domains_processed': 0,
+            'total_found': 0
         }
         self.lock = threading.Lock()
+        
+        # Queue untuk worker threads
+        self.task_queue = queue.Queue()
+        self.result_queue = queue.Queue()
         self.running = True
         
         # Initialize output file
         with open(self.output_file, 'w') as f:
-            f.write(f"# Hyperspeed Subdomain Crawl Results - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"# Target: 500+ URLs/sec\n\n")
+            f.write(f"# Fast Accurate Subdomain Results - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# Format: Satu domain per baris\n\n")
     
-    def jq_parse_crtsh(self, data: str) -> Set[str]:
-        """Parse crt.sh dengan jq untuk kecepatan maksimal"""
+    def parse_crtsh(self, data, domain) -> Set[str]:
+        """Parse crt.sh - PALING AKURAT"""
+        subdomains = set()
         try:
-            # Gunakan jq untuk extract domain dengan sangat cepat
-            cmd = ['jq', '-r', '.[] | select(.name_value != null) | .name_value | split("\\n")[] | sub("^\\\\*\\."; "") | select(endswith("{domain}"))']
-            
-            # Ganti placeholder dengan regex di jq
-            proc = subprocess.run(cmd, input=data, capture_output=True, text=True, timeout=5)
-            if proc.returncode == 0:
-                return set(proc.stdout.strip().split('\n'))
+            if isinstance(data, list):
+                for entry in data:
+                    if isinstance(entry, dict):
+                        name = entry.get('name_value', '')
+                        if name:
+                            for line in name.split('\n'):
+                                line = line.strip().lower()
+                                if line and (line.endswith(f".{domain}") or line == domain):
+                                    if line.startswith('*.'):
+                                        line = line[2:]
+                                    # Validasi: harus mengandung domain
+                                    if domain in line:
+                                        subdomains.add(line)
         except:
             pass
-        return set()
+        return subdomains
     
-    def jq_parse_json(self, data: str, jq_filter: str) -> Set[str]:
-        """Generic jq parser untuk JSON apapun"""
+    def parse_hackertarget(self, data, domain) -> Set[str]:
+        """Parse HackerTarget - SANGAT AKURAT"""
+        subdomains = set()
         try:
-            proc = subprocess.run(['jq', '-r', jq_filter], 
-                                 input=data, capture_output=True, text=True, timeout=3)
-            if proc.returncode == 0 and proc.stdout.strip():
-                return set(proc.stdout.strip().split('\n'))
+            if isinstance(data, str):
+                for line in data.split('\n'):
+                    if ',' in line:
+                        sub = line.split(',')[0].strip().lower()
+                        if sub and sub.endswith(f".{domain}") and domain in sub:
+                            subdomains.add(sub)
         except:
             pass
-        return set()
+        return subdomains
     
-    def rapid_batch_request(self, urls: List[str]) -> Dict[str, str]:
-        """
-        Batch request dengan keep-alive dan connection pooling
-        Menggunakan curl paralel untuk kecepatan maksimal
-        """
-        if not urls:
-            return {}
-        
-        # Buat temporary file untuk URLs
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-            for url in urls:
-                f.write(f"{url}\n")
-            url_file = f.name
+    def parse_alienvault(self, data, domain) -> Set[str]:
+        """Parse AlienVault - SANGAT AKURAT"""
+        subdomains = set()
+        try:
+            if isinstance(data, dict):
+                for entry in data.get('passive_dns', []):
+                    if isinstance(entry, dict):
+                        hostname = entry.get('hostname', '').lower()
+                        if hostname and hostname.endswith(f".{domain}") and domain in hostname:
+                            subdomains.add(hostname)
+        except:
+            pass
+        return subdomains
+    
+    def parse_urlscan(self, data, domain) -> Set[str]:
+        """Parse URLScan.io"""
+        subdomains = set()
+        try:
+            if isinstance(data, dict):
+                for result in data.get('results', []):
+                    if isinstance(result, dict):
+                        page = result.get('page', {})
+                        if isinstance(page, dict):
+                            url_domain = page.get('domain', '') or page.get('url', '')
+                            if url_domain:
+                                parsed = urlparse(f"http://{url_domain}")
+                                host = parsed.netloc or parsed.path
+                                if host:
+                                    host = host.split(':')[0].lower()
+                                    if host.endswith(f".{domain}") and domain in host:
+                                        subdomains.add(host)
+        except:
+            pass
+        return subdomains
+    
+    def parse_wayback(self, data, domain) -> Set[str]:
+        """Parse Wayback Machine"""
+        subdomains = set()
+        try:
+            if isinstance(data, list) and len(data) > 1:
+                for entry in data[1:]:
+                    if entry and len(entry) > 0:
+                        url = entry[0]
+                        if url:
+                            parsed = urlparse(url)
+                            host = parsed.netloc or parsed.path
+                            if host:
+                                host = host.split(':')[0].lower()
+                                if host.endswith(f".{domain}") and domain in host:
+                                    subdomains.add(host)
+        except:
+            pass
+        return subdomains
+    
+    def parse_bufferover(self, data, domain) -> Set[str]:
+        """Parse BufferOver.run"""
+        subdomains = set()
+        try:
+            if isinstance(data, dict):
+                for key in ['FDNS_A', 'RDNS']:
+                    for entry in data.get(key, []):
+                        if isinstance(entry, str):
+                            parts = entry.split(',')
+                            if len(parts) >= 2:
+                                sub = parts[1].strip().lower()
+                                if sub.endswith(f".{domain}") and domain in sub:
+                                    subdomains.add(sub)
+        except:
+            pass
+        return subdomains
+    
+    def parse_rapiddns(self, data, domain) -> Set[str]:
+        """Parse RAPIDDNS"""
+        subdomains = set()
+        try:
+            if isinstance(data, list):
+                for entry in data:
+                    if isinstance(entry, dict):
+                        name = entry.get('name', '').lower()
+                        if name and name.endswith(f".{domain}") and domain in name:
+                            subdomains.add(name)
+        except:
+            pass
+        return subdomains
+    
+    def parse_anubis(self, data, domain) -> Set[str]:
+        """Parse Anubis"""
+        subdomains = set()
+        try:
+            if isinstance(data, list):
+                for sub in data:
+                    if isinstance(sub, str):
+                        sub = sub.lower()
+                        if sub.endswith(f".{domain}") and domain in sub:
+                            subdomains.add(sub)
+        except:
+            pass
+        return subdomains
+    
+    def parse_threatcrowd(self, data, domain) -> Set[str]:
+        """Parse ThreatCrowd"""
+        subdomains = set()
+        try:
+            if isinstance(data, dict):
+                for sub in data.get('subdomains', []):
+                    if isinstance(sub, str):
+                        sub = sub.lower()
+                        if sub.endswith(f".{domain}") and domain in sub:
+                            subdomains.add(sub)
+        except:
+            pass
+        return subdomains
+    
+    def query_source(self, source_name: str, domain: str) -> Set[str]:
+        """Query single source dengan error handling"""
+        source = self.sources[source_name]
+        url = source['url'].format(domain=domain)
+        subdomains = set()
         
         try:
-            # Gunakan curl dengan parallel (xargs) untuk speed maksimal
-            cmd = f"xargs -P {self.threads} -I {{}} curl -s -k -L --connect-timeout 3 -m 5 {{}} < {url_file}"
-            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            with self.lock:
+                self.stats['total_requests'] += 1
             
-            # Parse output (format: URL:::RESPONSE)
-            results = {}
-            if proc.returncode == 0:
-                # TODO: Parse hasil curl
-                pass
-        finally:
-            os.unlink(url_file)
-        
-        return results
-    
-    def curl_batch_get(self, urls: List[str]) -> List[tuple]:
-        """
-        Gunakan curl parallel untuk fetch banyak URL sekaligus
-        Ini JAUH lebih cepat daripada requests python
-        """
-        if not urls:
-            return []
-        
-        results = []
-        
-        # Buat file untuk URLs
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-            for url in urls:
-                f.write(f"{url}\n")
-            url_file = f.name
-        
-        # Buat file untuk output
-        output_file = tempfile.mktemp()
-        
-        try:
-            # Gunakan curl dengan parallel processing
-            # --parallel --parallel-immediate untuk maksimum kecepatan
-            cmd = [
-                'curl', '--parallel', '--parallel-immediate', 
-                '--parallel-max', str(self.threads),
-                '-s', '-k', '-L',
-                '--connect-timeout', '3',
-                '--max-time', '5',
-                '--retry', '1',
-                '--output', '/dev/null',
-                '--write-out', '%{url_effective}:::HTTP_%{http_code}:::%{size_download}:::time_total:%{time_total}\\n',
-                '--config', url_file
-            ]
+            response = self.session.get(url, timeout=10, verify=False)
             
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            
-            if proc.returncode == 0:
-                for line in proc.stdout.split('\n'):
-                    if line.strip():
-                        parts = line.split(':::')
-                        if len(parts) >= 2:
-                            url = parts[0]
-                            status = parts[1]
-                            results.append((url, status))
-            
-            # Juga ambil response bodies jika perlu
-            cmd_body = [
-                'curl', '--parallel', '--parallel-immediate',
-                '--parallel-max', str(self.threads),
-                '-s', '-k', '-L',
-                '--connect-timeout', '3',
-                '--max-time', '5',
-                '--config', url_file
-            ]
-            
-            proc_body = subprocess.run(cmd_body, capture_output=True, text=True, timeout=30)
-            if proc_body.returncode == 0 and proc_body.stdout:
-                # Simpan response untuk parsing nanti
-                with open(f"{output_file}.bodies", 'w') as f:
-                    f.write(proc_body.stdout)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                except:
+                    data = response.text
+                
+                subdomains = source['parser'](data, domain)
+                
+                with self.lock:
+                    self.stats['successful'] += 1
+                    self.stats['by_source'][source_name] = self.stats['by_source'].get(source_name, 0) + len(subdomains)
+                
+                if subdomains:
+                    print(f"{Colors.GREEN}    ✓ {source_name}: {len(subdomains)} ditemukan{Colors.RESET}")
+                
+            else:
+                with self.lock:
+                    self.stats['failed'] += 1
                     
         except Exception as e:
-            print(f"{Colors.RED}Curl error: {e}{Colors.RESET}")
-        finally:
-            os.unlink(url_file)
+            with self.lock:
+                self.stats['failed'] += 1
         
-        return results
+        return subdomains
     
-    def rapid_scan_domain(self, domain: str) -> Set[str]:
-        """
-        Hyper-optimized domain scanning
-        Menggunakan multiple teknik parallel untuk kecepatan maksimal
-        """
-        all_found = set()
-        queue = [domain]
-        scanned = set()
-        
-        # Siapkan semua URL yang akan di-request
-        api_urls = []
-        api_configs = []
-        
-        # Prepare all API URLs untuk batch processing
-        for current in queue:
-            if current in scanned:
-                continue
-            scanned.add(current)
-            
-            # crt.sh
-            api_urls.append(f"https://crt.sh/?q=%.{current}&output=json")
-            api_configs.append(('crt.sh', current))
-            
-            # Hackertarget
-            api_urls.append(f"https://api.hackertarget.com/hostsearch/?q={current}")
-            api_configs.append(('hackertarget', current))
-            
-            # AlienVault
-            api_urls.append(f"https://otx.alienvault.com/api/v1/indicators/domain/{current}/passive_dns")
-            api_configs.append(('alienvault', current))
-            
-            # RapidDNS
-            api_urls.append(f"https://rapiddns.io/subdomain/{current}?full=1&output=json")
-            api_configs.append(('rapiddns', current))
-            
-            # BufferOver
-            api_urls.append(f"https://dns.bufferover.run/dns?q=.{current}")
-            api_configs.append(('bufferover', current))
-        
-        # BATCH REQUEST SEMUA URL SEKALIGUS
-        print(f"{Colors.CYAN}  ⚡ Batch requesting {len(api_urls)} URLs for {domain}{Colors.RESET}")
-        
-        # Method 1: Parallel curl
-        curl_results = self.curl_batch_get(api_urls)
-        
-        # Method 2: ThreadPool untuk parsing
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = []
-            
-            # Parse setiap response
-            for i, (url, status) in enumerate(curl_results):
-                if '200' in status:
-                    source, target = api_configs[i]
-                    future = executor.submit(self.parse_source_response, source, target, None)  # TODO: Pass response body
-                    futures.append(future)
-            
-            for future in as_completed(futures):
-                try:
-                    new_subs = future.result(timeout=5)
-                    all_found.update(new_subs)
-                except:
-                    pass
-        
-        return all_found
-    
-    def parse_source_response(self, source: str, domain: str, response_body: str) -> Set[str]:
-        """Parse response berdasarkan source"""
-        if not response_body:
-            return set()
-        
-        try:
-            if source == 'crt.sh':
-                # Parse dengan jq untuk kecepatan
-                cmd = f"echo '{response_body}' | jq -r '.[] | .name_value // empty' | grep -E '\\.{domain}$' | sed 's/^\\*\\.//'"
-                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2)
-                if proc.returncode == 0:
-                    return set(proc.stdout.strip().split('\n'))
-            
-            elif source == 'hackertarget':
-                # Hackertarget format: domain,ip
-                cmd = f"echo '{response_body}' | cut -d',' -f1 | grep -E '\\.{domain}$'"
-                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2)
-                if proc.returncode == 0:
-                    return set(proc.stdout.strip().split('\n'))
-            
-            elif source == 'alienvault':
-                cmd = f"echo '{response_body}' | jq -r '.passive_dns[]?.hostname // empty' | grep -E '\\.{domain}$'"
-                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2)
-                if proc.returncode == 0:
-                    return set(proc.stdout.strip().split('\n'))
-            
-            elif source == 'rapiddns':
-                cmd = f"echo '{response_body}' | jq -r '.[]?.name // empty' | grep -E '\\.{domain}$'"
-                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2)
-                if proc.returncode == 0:
-                    return set(proc.stdout.strip().split('\n'))
-            
-            elif source == 'bufferover':
-                cmd = f"echo '{response_body}' | jq -r '.FDNS_A[]?, .RDNS[]?' | cut -d',' -f2 | grep -E '\\.{domain}$'"
-                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2)
-                if proc.returncode == 0:
-                    return set(proc.stdout.strip().split('\n'))
+    def worker(self):
+        """Worker thread untuk memproses domain"""
+        while self.running:
+            try:
+                domain, depth, max_depth = self.task_queue.get(timeout=1)
+                
+                if domain in self.processed_domains:
+                    self.task_queue.task_done()
+                    continue
+                
+                with self.lock:
+                    self.processed_domains.add(domain)
+                
+                indent = "  " * depth
+                print(f"\n{indent}{Colors.CYAN}[Depth {depth}] Scanning: {domain}{Colors.RESET}")
+                
+                # Query semua sources untuk domain ini
+                all_subs = set()
+                for source_name in self.sources:
+                    subs = self.query_source(source_name, domain)
+                    all_subs.update(subs)
+                    time.sleep(self.delay)  # Rate limiting
+                
+                # Filter subdomain yang valid (harus mengandung domain parent)
+                valid_subs = set()
+                for sub in all_subs:
+                    if domain in sub and sub not in self.all_subdomains:
+                        valid_subs.add(sub)
+                
+                if valid_subs:
+                    with self.lock:
+                        for sub in valid_subs:
+                            self.all_subdomains.add(sub)
+                            self.stats['total_found'] += 1
                     
+                    # Simpan ke file
+                    self.save_subdomains(valid_subs)
+                    
+                    print(f"{indent}{Colors.GREEN}  ✓ Menemukan {len(valid_subs)} subdomain baru{Colors.RESET}")
+                    
+                    # Tambahkan subdomain baru ke queue untuk depth berikutnya
+                    if depth < max_depth:
+                        for sub in valid_subs:
+                            if sub != domain and sub.count('.') > domain.count('.'):
+                                self.task_queue.put((sub, depth + 1, max_depth))
+                else:
+                    print(f"{indent}{Colors.YELLOW}  - Tidak ada subdomain baru{Colors.RESET}")
+                
+                self.task_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"{Colors.RED}Worker error: {e}{Colors.RESET}")
+                self.task_queue.task_done()
+    
+    def save_subdomains(self, subdomains: Set[str]):
+        """Save to file"""
+        try:
+            with open(self.output_file, 'a') as f:
+                for sub in sorted(subdomains):
+                    f.write(f"{sub}\n")
         except:
             pass
-        
-        return set()
     
-    def process_domain_batch(self, domains: List[str]) -> Dict[str, Set[str]]:
-        """Process multiple domains sekaligus dalam satu batch"""
-        results = {}
-        
-        # Kumpulkan semua API URLs untuk semua domains
-        all_api_urls = []
-        url_to_info = []
-        
-        for domain in domains:
-            # crt.sh
-            all_api_urls.append(f"https://crt.sh/?q=%.{domain}&output=json")
-            url_to_info.append(('crt.sh', domain))
-            
-            # hackertarget
-            all_api_urls.append(f"https://api.hackertarget.com/hostsearch/?q={domain}")
-            url_to_info.append(('hackertarget', domain))
-            
-            # alienvault
-            all_api_urls.append(f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns")
-            url_to_info.append(('alienvault', domain))
-        
-        # Batch request semua URLs
-        print(f"{Colors.MAGENTA}⚡ Batch processing {len(domains)} domains ({len(all_api_urls)} URLs){Colors.RESET}")
-        
-        # Gunakan curl parallel
-        responses = self.curl_batch_get(all_api_urls)
-        
-        # Parse responses dengan ThreadPool
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            future_to_info = {}
-            
-            for i, (url, status) in enumerate(responses):
-                if '200' in status:
-                    source, domain = url_to_info[i]
-                    # TODO: Dapatkan response body
-                    future = executor.submit(self.parse_source_response, source, domain, "")
-                    future_to_info[future] = (source, domain)
-            
-            for future in as_completed(future_to_info):
-                source, domain = future_to_info[future]
-                try:
-                    subs = future.result(timeout=5)
-                    if domain not in results:
-                        results[domain] = set()
-                    results[domain].update(subs)
-                except:
-                    pass
-        
-        return results
+    def load_existing(self):
+        """Load existing results"""
+        if os.path.exists(self.output_file):
+            try:
+                with open(self.output_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            self.all_subdomains.add(line)
+                print(f"{Colors.CYAN}📂 Loaded {len(self.all_subdomains)} existing subdomains{Colors.RESET}")
+            except:
+                pass
     
-    def hyperspeed_crawl(self, input_file: str, max_depth: int = 2):
-        """Main crawling function dengan kecepatan maksimal"""
+    def fast_accurate_crawl(self, input_file: str, max_depth: int = 2):
+        """Main crawling function - CEPAT DAN AKURAT"""
         if not os.path.exists(input_file):
             print(f"{Colors.RED}Error: File {input_file} tidak ditemukan{Colors.RESET}")
             return
         
-        # Baca semua domains
+        # Load existing
+        self.load_existing()
+        
+        # Set untuk track processed domains
+        self.processed_domains = set()
+        
+        # Baca domains dari file
         domains = []
         with open(input_file, 'r') as f:
             for line in f:
@@ -365,81 +422,118 @@ class HyperspeedCrawler:
         domains = list(set(domains))
         
         print(f"\n{Colors.BOLD}{Colors.MAGENTA}{'='*70}{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.MAGENTA}  🚀 HYPERSPEED SUBDOMAIN CRAWLER{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.MAGENTA}  🚀 FAST + ACCURATE SUBDOMAIN CRAWLER{Colors.RESET}")
         print(f"{Colors.BOLD}{Colors.MAGENTA}{'='*70}{Colors.RESET}\n")
         
         print(f"{Colors.WHITE}📁 Total domains: {len(domains)}")
+        print(f"📊 Existing: {len(self.all_subdomains)}")
         print(f"⚡ Threads: {self.threads}")
-        print(f"📦 Batch size: {self.batch_size}")
-        print(f"⏱️  Target: 500+ URLs/sec")
+        print(f"📏 Max depth: {max_depth}")
+        print(f"⏱️  Delay: {self.delay}s")
         print(f"📄 Output: {self.output_file}{Colors.RESET}\n")
         
-        start_time = time.time()
+        # Start workers
+        workers = []
+        for _ in range(self.threads):
+            t = threading.Thread(target=self.worker, daemon=True)
+            t.start()
+            workers.append(t)
         
-        # Process dalam batch besar
-        for i in range(0, len(domains), self.batch_size):
-            batch = domains[i:i+self.batch_size]
-            batch_num = i//self.batch_size + 1
-            total_batches = (len(domains) + self.batch_size - 1) // self.batch_size
-            
-            print(f"\n{Colors.BOLD}{Colors.GREEN}[Batch {batch_num}/{total_batches}] Processing {len(batch)} domains{Colors.RESET}")
-            
-            # Process batch dengan parallel maksimal
-            batch_results = self.process_domain_batch(batch)
-            
-            # Simpan hasil
-            new_subs = set()
-            for domain, subs in batch_results.items():
-                for sub in subs:
-                    if sub not in self.all_subdomains:
-                        self.all_subdomains.add(sub)
-                        new_subs.add(sub)
-            
-            if new_subs:
-                self.save_subdomains(new_subs)
-            
-            # Hitung speed
-            elapsed = time.time() - start_time
-            rate = len(self.all_subdomains) / elapsed if elapsed > 0 else 0
-            
-            print(f"{Colors.CYAN}  📊 Found {len(new_subs)} new | Total: {len(self.all_subdomains)} | Rate: {rate:.0f}/sec{Colors.RESET}")
+        # Queue root domains
+        for domain in domains:
+            self.task_queue.put((domain, 0, max_depth))
+        
+        # Monitor progress
+        start_time = time.time()
+        last_count = 0
+        stall_counter = 0
+        
+        try:
+            while self.running:
+                time.sleep(2)
+                
+                queue_size = self.task_queue.qsize()
+                processed = len(self.processed_domains)
+                found = len(self.all_subdomains)
+                elapsed = time.time() - start_time
+                
+                rate = found / elapsed if elapsed > 0 else 0
+                
+                print(f"\r{Colors.BLUE}📊 Progress: {processed} domain diproses | {found} subdomain ditemukan | Queue: {queue_size} | Rate: {rate:.1f}/detik{Colors.RESET}", end="")
+                
+                # Cek jika selesai
+                if queue_size == 0 and processed == last_count:
+                    stall_counter += 1
+                    if stall_counter > 5:
+                        print(f"\n{Colors.GREEN}✅ Semua domain selesai diproses!{Colors.RESET}")
+                        break
+                else:
+                    stall_counter = 0
+                    last_count = processed
+                    
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}⚠️  Dihentikan user{Colors.RESET}")
+            self.running = False
+        
+        # Wait for queue to empty
+        self.task_queue.join()
+        self.running = False
         
         elapsed = time.time() - start_time
-        total_rate = len(self.all_subdomains) / elapsed
-        print(f"\n{Colors.GREEN}✅ COMPLETE! Total: {len(self.all_subdomains)} subdomains in {elapsed:.2f}s ({total_rate:.0f}/sec){Colors.RESET}")
+        self.print_summary(elapsed)
     
-    def save_subdomains(self, subdomains: Set[str]):
-        """Save subdomains to file"""
-        try:
-            with open(self.output_file, 'a') as f:
-                for sub in sorted(subdomains):
-                    f.write(f"{sub}\n")
-        except:
-            pass
+    def print_summary(self, elapsed):
+        """Print summary"""
+        print(f"\n\n{Colors.BOLD}{Colors.GREEN}{'='*70}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}  📊 CRAWLING COMPLETE{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}{'='*70}{Colors.RESET}\n")
+        
+        print(f"{Colors.WHITE}📈 Total subdomain unik: {Colors.CYAN}{len(self.all_subdomains):,}{Colors.RESET}")
+        print(f"{Colors.WHITE}🔍 Domain diproses: {Colors.CYAN}{len(self.processed_domains):,}{Colors.RESET}")
+        print(f"{Colors.WHITE}🌐 Total requests: {Colors.CYAN}{self.stats['total_requests']:,}{Colors.RESET}")
+        print(f"{Colors.WHITE}✅ Sukses: {Colors.GREEN}{self.stats['successful']:,}{Colors.RESET}")
+        print(f"{Colors.WHITE}❌ Gagal: {Colors.RED}{self.stats['failed']:,}{Colors.RESET}")
+        print(f"{Colors.WHITE}⏱️  Waktu: {Colors.CYAN}{elapsed:.2f} detik{Colors.RESET}")
+        print(f"{Colors.WHITE}⚡ Kecepatan: {Colors.CYAN}{len(self.all_subdomains)/elapsed:.1f} domain/detik{Colors.RESET}\n")
+        
+        # Top sources
+        print(f"{Colors.BOLD}🏆 Sumber Terbaik:{Colors.RESET}")
+        sorted_sources = sorted(self.stats['by_source'].items(), key=lambda x: x[1], reverse=True)
+        for source, count in sorted_sources[:5]:
+            print(f"  {Colors.YELLOW}{source:12}: {count:6,} subdomain{Colors.RESET}")
+        
+        print(f"\n{Colors.GREEN}✅ Hasil disimpan di: {self.output_file}{Colors.RESET}")
+        
+        # Sample
+        if self.all_subdomains:
+            print(f"\n{Colors.DIM}Contoh (10 pertama):{Colors.RESET}")
+            for sub in sorted(list(self.all_subdomains))[:10]:
+                print(f"  {Colors.WHITE}{sub}{Colors.RESET}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Hyperspeed Subdomain Crawler - 500+ URLs/sec")
-    parser.add_argument('--input', '-i', default='domains.txt', help='Input file')
+    parser = argparse.ArgumentParser(description="Fast + Accurate Subdomain Crawler")
+    parser.add_argument('--input', '-i', default='domains.txt', help='File input')
     parser.add_argument('--output', '-o', default='all_subdomains.txt', help='Output file')
-    parser.add_argument('--threads', '-t', type=int, default=200, help='Thread count (default: 200)')
-    parser.add_argument('--batch', '-b', type=int, default=1000, help='Batch size (default: 1000)')
+    parser.add_argument('--threads', '-t', type=int, default=50, help='Threads (default: 50)')
     parser.add_argument('--depth', '-d', type=int, default=2, help='Max depth (default: 2)')
+    parser.add_argument('--delay', type=float, default=0.01, help='Delay (default: 0.01)')
     
     args = parser.parse_args()
     
-    # Check for required tools
-    for tool in ['curl', 'jq', 'xargs']:
-        if not subprocess.run(f'which {tool}', shell=True, capture_output=True).returncode == 0:
-            print(f"{Colors.RED}Error: {tool} not found. Install with: apt-get install {tool}{Colors.RESET}")
-            return
-    
-    crawler = HyperspeedCrawler(
+    crawler = FastAccurateCrawler(
         output_file=args.output,
         threads=args.threads,
-        batch_size=args.batch
+        delay=args.delay
     )
     
-    crawler.hyperspeed_crawl(args.input, max_depth=args.depth)
+    crawler.fast_accurate_crawl(args.input, max_depth=args.depth)
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}⚠️  Dihentikan user{Colors.RESET}")
+        sys.exit(0)
+    except Exception as e:
+        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+        sys.exit(1)
